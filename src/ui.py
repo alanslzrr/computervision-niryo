@@ -1,6 +1,12 @@
 """
-Interfaz de usuario: dibujo sobre frames OpenCV, procesamiento de comandos de terminal
-y orquestacion del pick-and-place.
+Interfaz de usuario del laboratorio de piezas (``main.py``).
+
+Responsabilidades:
+    - Filtros por color/forma sobre la lista de objetos detectados.
+    - Dibujo del polígono del workspace, piezas, HUD y estado de filtros/selección.
+    - Lectura de comandos en hilo aparte y ejecución de pick con re-detección en frame fresco.
+
+No utilizar este módulo para el flujo de poker dice; ese está en ``poker.py``.
 """
 
 import queue
@@ -108,9 +114,12 @@ def input_worker(cmd_queue: "queue.Queue[str]") -> None:
 
 
 def pick_selected_object(picker: NiryoVisionPicker, obj: Dict, workspace_corners: np.ndarray) -> None:
-    """Recoge la pieza indicada por obj. Re-captura un frame fresco antes de recoger para usar
-    coordenadas actualizadas: re-detecta workspace (dianas) y objetos, busca el mejor match por
-    color/forma y proximidad al centroide original, luego ejecuta approach -> pick -> grasp -> home -> release."""
+    """Ejecuta pick-and-place de una pieza del laboratorio de formas/colores.
+
+    Re-captura imagen en pose de escaneo, vuelve a estimar workspace y objetos, empareja por
+    color+forma y cercanía al centroide previo, convierte a coordenadas robot y realiza
+    approach → pick → grasp → home → release → scan.
+    """
     target_color = obj["color"]
     target_shape = obj["shape"]
     original_cx, original_cy = obj["centroid"]
@@ -177,7 +186,17 @@ def process_command(
     visible_objects: List[Dict],
     workspace_corners: np.ndarray,
 ) -> bool:
-    """Procesa un comando de terminal. Retorna False si se debe salir del bucle principal (exit)."""
+    """Ejecuta un comando del menú de piezas (filtros, movimiento, pick, salida).
+
+    Args:
+        cmd_line: Entrada del usuario (p. ej. ``color red``, ``pick``).
+        picker: Estado compartido con ``main``.
+        visible_objects: Lista ya filtrada mostrada en el último frame.
+        workspace_corners: Esquinas del workspace para homografía en pick.
+
+    Returns:
+        False si se debe terminar el bucle (``exit``); True para continuar.
+    """
     if not cmd_line:
         return True
 

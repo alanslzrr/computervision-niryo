@@ -1,15 +1,17 @@
 """
-Niryo Poker Dice Vision — Identificacion de jugadas y pick-and-place de dados.
+Niryo Poker Dice Vision — detección de dados, clasificación CNN y evaluación de jugadas.
 
-Conecta al robot en posicion de escaneo, detecta dados en el workspace,
-clasifica cada cara con la CNN (ONNX), evalua la jugada de poker y permite
-recoger los dados por comandos de terminal (mismo patron que lab1).
+Integra ``capture.extract_dice_crops`` con ``DiceClassifier`` (ONNX) y ``evaluate_hand``.
+El robot puede depositar cada cara en columnas lógicas del workspace (``compute_drop_pose`` /
+``relative_to_robot_xy``) siguiendo el estado en ``NiryoVisionPicker``.
 
-Uso:
+**Ejecución**::
+
     python poker.py
 
-Comandos:
-    help | scan | home | open | clear | select N | pick | pick all | status | exit
+**Comandos de terminal** (similar al laboratorio de piezas): ``help``, ``scan``, ``home``,
+``open``, ``clear`` (post-colisión), ``reset`` (columnas de drop), ``select N``, ``pick``,
+``pick all``, ``status``, ``exit``. En la ventana OpenCV: ``q`` o ESC para cerrar.
 """
 
 import queue
@@ -24,7 +26,14 @@ from pyniryo import PoseObject
 
 from capture import extract_dice_crops
 from classifier import DiceClassifier
-from config import APPROACH_Z, PICK_Z, ROBOT_IP
+from config import (
+    APPROACH_Z,
+    DROP_COLUMN_X_REL,
+    DROP_SLOT_Y_REL,
+    DROP_Z,
+    PICK_Z,
+    ROBOT_IP,
+)
 from evaluator import evaluate_hand
 from robot import NiryoVisionPicker, relative_to_robot_xy
 from vision import detect_workspace_from_dianas, fallback_workspace_corners, pixel_to_relative
@@ -43,9 +52,59 @@ ORANGE = (0, 165, 255)
 # ============================================================================
 
 def bbox_center(bbox: Tuple[int, int, int, int]) -> Tuple[int, int]:
-    """Devuelve el centro (cx, cy) de un bounding rect (x, y, w, h)."""
+    """Centro entero de un rectángulo ``(x, y, ancho, alto)`` en píxeles."""
     x, y, w, h = bbox
     return (x + w // 2, y + h // 2)
+
+
+def force_open_gripper(picker: NiryoVisionPicker, sleep_after: float = 0.4) -> None:
+    """Garantiza que la pinza queda completamente abierta. Llama a release_with_tool
+    y, si esta disponible, tambien open_gripper como refuerzo. Espera lo suficiente
+    para que el servo termine el movimiento antes de continuar."""
+    try:
+        picker.robot.release_with_tool()
+    except Exception as e:
+        print(f"[WARN] release_with_tool fallo: {e}")
+    # Refuerzo: open_gripper es mas explicito para grippers (no todas las versiones
+    # de pyniryo lo exponen, asi que va en try/except).
+    try:
+        picker.robot.open_gripper(speed=500)
+    except Exception:
+        pass
+    time.sleep(sleep_after)
+
+
+def compute_drop_pose(
+    picker: NiryoVisionPicker,
+    face: str,
+) -> Tuple[PoseObject, PoseObject, float, float, int, int]:
+    """Calcula approach y drop pose para depositar un dado en la columna asignada
+    a su cara. La primera vez que se ve una cara se le asigna una columna libre;
+    los siguientes dados de la misma cara se apilan en slots Y dentro de su columna.
+
+    Devuelve (drop_approach, drop_pose, x_rel, y_rel, col_idx, slot_idx).
+    """
+    col_idx, slot_idx = picker.assign_drop_slot(face)
+
+    if col_idx >= len(DROP_COLUMN_X_REL):
+        print(f"[DROP] Sin columnas libres ({col_idx + 1}), reusando ultima columna")
+        col_idx = len(DROP_COLUMN_X_REL) - 1
+    if slot_idx >= len(DROP_SLOT_Y_REL):
+        print(f"[DROP] Columna de '{face}' llena ({slot_idx + 1} dados), reusando ultimo slot")
+        slot_idx = len(DROP_SLOT_Y_REL) - 1
+
+    x_rel = DROP_COLUMN_X_REL[col_idx]
+    y_rel = DROP_SLOT_Y_REL[slot_idx]
+
+    drop_x, drop_y = relative_to_robot_xy(x_rel, y_rel)
+
+    drop_approach = PoseObject(
+        drop_x, drop_y, APPROACH_Z, picker.pick_roll, picker.pick_pitch, picker.pick_yaw
+    )
+    drop_pose = PoseObject(
+        drop_x, drop_y, DROP_Z, picker.pick_roll, picker.pick_pitch, picker.pick_yaw
+    )
+    return drop_approach, drop_pose, x_rel, y_rel, col_idx, slot_idx
 
 
 def pick_dice(
@@ -56,13 +115,21 @@ def pick_dice(
     target_cy: int,
     workspace_corners: np.ndarray,
 ) -> None:
-    """Recoge el dado indicado por (target_face, target_cx, target_cy).
+    """Recoge el dado indicado por (target_face, target_cx, target_cy) y lo deposita
+    en la columna asignada a su cara dentro del workspace.
 
-    Antes de mover el brazo se vuelve a la pose de scan, se captura un frame
-    fresco, se re-detectan las dianas, se re-extraen y re-clasifican los dados,
-    y se elige el dado con la cara objetivo mas cercano al centroide original.
-    Luego ejecuta approach -> pick -> grasp -> approach -> home -> release -> scan.
+    Antes de mover el brazo se ABRE la pinza (puede haber quedado entreabierta del
+    drop anterior), se vuelve a la pose de scan, se captura un frame fresco, se
+    re-detectan las dianas, se re-extraen y re-clasifican los dados, y se elige el
+    dado con la cara objetivo mas cercano al centroide original.
+    Luego ejecuta:
+        open_gripper -> approach_pick -> pick -> grasp -> approach_pick ->
+        approach_drop -> drop -> release -> open_gripper -> approach_drop -> scan.
     """
+    # --- Asegurar pinza completamente abierta antes de mover ---
+    print("[PICK] Abriendo pinza (pre-scan)...")
+    force_open_gripper(picker)
+
     print("[PICK] Volviendo a scan y re-capturando frame...")
     picker.move_scan()
     fresh_frame = picker.capture_frame()
@@ -112,14 +179,35 @@ def pick_dice(
         f"       rel=({x_rel:.3f},{y_rel:.3f}) robot_xy=({x:.4f},{y:.4f},{PICK_Z:.4f})"
     )
 
+    # CRITICO: refuerzo de apertura justo antes de la aproximacion. Si por
+    # cualquier razon la pinza quedo entreabierta tras el drop anterior o no
+    # termino el movimiento, este es el ultimo punto seguro para forzarla.
+    print("[PICK] Refuerzo apertura pinza pre-aproximacion...")
+    force_open_gripper(picker)
+
     picker.robot.move(approach_pose)
     picker.robot.move(pick_pose)
     picker.robot.grasp_with_tool()
     time.sleep(0.2)
     picker.robot.move(approach_pose)
 
-    picker.move_home()
-    picker.robot.release_with_tool()
+    # --- Drop en la columna asignada a esta cara ---
+    drop_approach, drop_pose, dx_rel, dy_rel, col_idx, slot_idx = compute_drop_pose(
+        picker, target_face
+    )
+    drop_x, drop_y = drop_pose.x, drop_pose.y
+    print(
+        f"[DROP] Cara '{target_face}' -> col {col_idx + 1}/{len(DROP_COLUMN_X_REL)} "
+        f"slot {slot_idx + 1}/{len(DROP_SLOT_Y_REL)}\n"
+        f"       rel=({dx_rel:.2f},{dy_rel:.2f}) robot_xy=({drop_x:.4f},{drop_y:.4f},{DROP_Z:.4f})"
+    )
+    picker.robot.move(drop_approach)
+    picker.robot.move(drop_pose)
+    # Apertura agresiva al soltar para que el dado caiga limpio y la pinza
+    # quede totalmente abierta para el siguiente pick.
+    force_open_gripper(picker)
+    picker.robot.move(drop_approach)
+
     picker.move_scan()
 
 
@@ -134,9 +222,10 @@ def print_help() -> None:
     print("  home       - Mover a home oficial")
     print("  open       - Abrir pinza")
     print("  clear      - Limpiar flag de colision (retirar obstaculo antes)")
+    print("  reset      - Resetear contadores de columnas de drop (entre rondas)")
     print("  select N   - Seleccionar dado N de los visibles")
-    print("  pick       - Pick-and-place del dado seleccionado")
-    print("  pick all   - Recoger todos los dados detectados (uno a uno)")
+    print("  pick       - Pick-and-place del dado seleccionado en la columna de la jugada")
+    print("  pick all   - Recoger todos los dados detectados a la columna de la jugada")
     print("  status     - Estado actual")
     print("  exit       - Salir")
 
@@ -157,8 +246,21 @@ def process_command(
     classifier: DiceClassifier,
     current_dice: List[Tuple[str, float, tuple]],
     workspace_corners: np.ndarray,
+    hand_name: str,
 ) -> bool:
-    """Procesa un comando de terminal. Retorna False si se debe salir del bucle principal."""
+    """Interpreta una línea de comando del hilo de entrada.
+
+    Args:
+        cmd_line: Texto sin prefijo (p. ej. ``pick``, ``select 2``).
+        picker: Estado del robot y selección actual.
+        classifier: Para re-clasificar en ``pick_dice``.
+        current_dice: Lista del frame actual ``(cara, confianza, bbox)``.
+        workspace_corners: Homografía del workspace en uso.
+        hand_name: Nombre de jugada actual (solo informativo en ``status`` / ``pick all``).
+
+    Returns:
+        False si el bucle principal debe terminar (comando ``exit``); True en caso contrario.
+    """
     if not cmd_line:
         return True
 
@@ -195,9 +297,20 @@ def process_command(
             print(f"[ERROR] Fallo al limpiar colision: {e}")
         return True
 
+    if cmd == "reset":
+        picker.reset_drops()
+        return True
+
     if cmd == "status":
         labels = ", ".join(f"{i}:{face}" for i, (face, _, _) in enumerate(current_dice, start=1))
-        print(f"Status -> visibles={len(current_dice)} [{labels}], sel={picker.selected_index}")
+        cols = ", ".join(
+            f"{f}->col{c + 1}({picker.face_slot_counts.get(f, 0)})"
+            for f, c in picker.face_columns.items()
+        ) or "vacio"
+        print(
+            f"Status -> visibles={len(current_dice)} [{labels}], sel={picker.selected_index}, "
+            f"jugada={hand_name}, columnas=[{cols}]"
+        )
         return True
 
     if cmd == "select" and len(parts) == 2:
@@ -215,13 +328,16 @@ def process_command(
         return True
 
     if cmd == "pick":
-        # pick all
+        # pick all — agrupa por cara, cada cara distinta a su propia columna
         if len(parts) == 2 and parts[1].lower() == "all":
             valid = [(face, bbox_center(bbox)) for face, conf, bbox in current_dice if face != "UNKNOWN"]
             if not valid:
                 print("No hay dados clasificados para recoger")
                 return True
-            print(f"\n[PICK ALL] Recogiendo {len(valid)} dado(s)...")
+            # Ordenar por cara para que dados de la misma cara se procesen consecutivos
+            # (asi la columna se llena en orden y queda mas vistoso visualmente)
+            valid.sort(key=lambda x: x[0])
+            print(f"\n[PICK ALL] Jugada '{hand_name}' — recogiendo {len(valid)} dado(s)...")
             for i, (face, (cx, cy)) in enumerate(valid, start=1):
                 print(f"\n[PICK ALL] {i}/{len(valid)}: dado '{face}' en ({cx},{cy})")
                 try:
@@ -272,6 +388,7 @@ def process_command(
 # ============================================================================
 
 def run() -> None:
+    """Bucle en vivo: captura, detección de dados, clasificación, HUD de jugada y comandos."""
     picker = NiryoVisionPicker(ROBOT_IP)
     classifier = DiceClassifier()
     workspace_corners = None
@@ -379,7 +496,9 @@ def run() -> None:
             # Procesar comandos pendientes
             while not cmd_queue.empty():
                 cmd_line = cmd_queue.get_nowait()
-                running = process_command(cmd_line, picker, classifier, results, ws)
+                running = process_command(
+                    cmd_line, picker, classifier, results, ws, hand_name
+                )
                 if not running:
                     break
 

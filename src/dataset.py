@@ -1,34 +1,30 @@
 """
-Utilidades para captura y almacenamiento de imagenes de entrenamiento.
+Herramientas para crear y revisar el dataset de imágenes de dados (entrenamiento CNN).
 
-Permite capturar crops de dados desde la camara del robot, etiquetarlos
-manualmente y guardarlos organizados por clase para entrenar la CNN.
-
-TODO: Integrar como comando 'dataset' en ui.process_command para
-      activar el modo de captura interactivo desde la terminal del sistema.
+Proporciona creación de árbol de carpetas por clase, guardado de recortes PNG y un modo
+interactivo opcional para etiquetar detecciones. El flujo principal de captura en laboratorio
+está implementado de forma más completa en ``capture.py``; este módulo puede reutilizarse para
+scripts auxiliares o integración futura con ``ui.process_command``.
 """
 
 import os
 import time
-from typing import List
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 
 from config import DATASET_DIR, DICE_FACES
 
+if TYPE_CHECKING:
+    from robot import NiryoVisionPicker
+
 
 def ensure_dataset_dirs(dataset_dir: str = DATASET_DIR) -> None:
-    """Crea la estructura de directorios para el dataset: una carpeta por cada cara de dado.
+    """Crea bajo ``dataset_dir`` una subcarpeta por cada etiqueta en ``DICE_FACES``.
 
-    Estructura resultante:
-        dataset/
-            9/
-            10/
-            J/
-            Q/
-            K/
-            A/
+    Args:
+        dataset_dir: Directorio raíz del dataset (por defecto ``config.DATASET_DIR``).
     """
     for face in DICE_FACES:
         path = os.path.join(dataset_dir, face)
@@ -37,18 +33,18 @@ def ensure_dataset_dirs(dataset_dir: str = DATASET_DIR) -> None:
 
 
 def save_crop(crop: np.ndarray, label: str, dataset_dir: str = DATASET_DIR) -> str:
-    """Guarda un crop etiquetado como PNG en dataset_dir/<label>/.
+    """Guarda un recorte etiquetado como PNG en ``dataset_dir/<label>/``.
 
     Args:
-        crop: Imagen BGR del dado recortado.
-        label: Cara del dado (debe estar en DICE_FACES).
-        dataset_dir: Directorio raiz del dataset.
+        crop: Imagen BGR del dado.
+        label: Una de las caras en ``DICE_FACES``.
+        dataset_dir: Raíz del dataset.
 
     Returns:
-        Ruta completa del archivo guardado.
+        Ruta absoluta o relativa del archivo escrito.
 
     Raises:
-        ValueError: Si el label no es una cara valida.
+        ValueError: Si ``label`` no es una clase válida.
     """
     if label not in DICE_FACES:
         raise ValueError(f"Label '{label}' no valido. Opciones: {DICE_FACES}")
@@ -65,9 +61,10 @@ def save_crop(crop: np.ndarray, label: str, dataset_dir: str = DATASET_DIR) -> s
 
 
 def get_dataset_summary(dataset_dir: str = DATASET_DIR) -> dict:
-    """Retorna un resumen del numero de imagenes por clase en el dataset.
+    """Cuenta imágenes ``.png`` por clase para comprobar balance antes de entrenar.
 
-    TODO: Usar para verificar balance de clases antes de entrenar.
+    Returns:
+        Diccionario ``cara -> número de archivos``.
     """
     summary = {}
     for face in DICE_FACES:
@@ -80,28 +77,26 @@ def get_dataset_summary(dataset_dir: str = DATASET_DIR) -> dict:
     return summary
 
 
-def capture_dataset_mode(picker, detect_fn, workspace_corners: np.ndarray) -> None:
-    """Modo interactivo de captura de dataset.
+def capture_dataset_mode(picker: "NiryoVisionPicker", detect_fn, workspace_corners: np.ndarray) -> None:
+    """Modo mínimo de captura por consola sobre una sola captura de frame.
 
-    Captura frames, detecta objetos, muestra cada crop y pide al usuario
-    que lo etiquete con la cara correspondiente. Guarda los crops etiquetados.
+    Detecta objetos con ``detect_fn`` (típicamente ``vision.detect_objects``), muestra cada
+    recorte y pide la etiqueta por teclado. Para salir se usa la letra ``Q`` mayúscula; tener en
+    cuenta la colisión con la cara ``Q`` (reina) — en ese caso conviene usar ``capture.py``.
 
     Args:
-        picker: Instancia de NiryoVisionPicker (para capture_frame).
-        detect_fn: Funcion de deteccion (vision.detect_objects).
-        workspace_corners: Esquinas del workspace para la deteccion.
+        picker: Instancia conectada con ``capture_frame``.
+        detect_fn: Función ``(frame, workspace_corners) -> lista de objetos``.
+        workspace_corners: Matriz de esquinas del workspace en píxeles.
 
-    TODO:
-        - Implementar el loop interactivo completo
-        - Mostrar ventana con crop ampliado para facilitar etiquetado
-        - Opcion de descartar crops malos (tecla 's' para skip)
-        - Mostrar resumen de imagenes capturadas al salir
+    Note:
+        Flujo simplificado; para captura continua y teclas en ventana preferir ``capture.run_capture``.
     """
     ensure_dataset_dirs()
 
     print("\n[DATASET] Modo captura activado")
     print(f"  Caras validas: {DICE_FACES}")
-    print("  Escribe la cara del dado para etiquetar, 's' para skip, 'q' para salir")
+    print("  Etiqueta por dado; 'S' skip; 'Q' salir (mayúscula)")
 
     frame = picker.capture_frame()
     objects = detect_fn(frame, workspace_corners)

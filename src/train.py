@@ -1,14 +1,17 @@
 """
-Entrenamiento de CNN para clasificacion de caras de dados de poker.
+Entrenamiento de la CNN para clasificación de caras de dados de poker (PyTorch → ONNX).
 
-Carga imagenes desde dataset/, entrena una CNN de 3 bloques conv con PyTorch,
-evalua con metricas estandar y exporta el modelo a ONNX para inferencia
-con classifier.py (DiceClassifier).
+Flujo típico:
+    1. Carga recursiva de ``.png`` bajo ``DATASET_DIR/<cara>/``.
+    2. Partición estratificada train/val; aumento solo en entrenamiento.
+    3. Optimización Adam con weight decay; mejor checkpoint por accuracy de validación.
+    4. Informe: matriz de confusión, ``classification_report``, export ONNX y validación con ONNX Runtime.
 
-IMPORTANTE: Las imagenes se cargan con cv2 (BGR) y se normalizan a [0,1] sin
-convertir a RGB. Esto es critico para mantener paridad con DiceClassifier.preprocess_crop().
+**Paridad BGR**: las imágenes se leen con OpenCV (orden BGR) y se normalizan a [0, 1] sin pasar a RGB.
+Cualquier cambio aquí debe replicarse en ``classifier.DiceClassifier.preprocess_crop``.
 
-Uso:
+Uso desde la raíz del paquete::
+
     python train.py
 """
 
@@ -25,7 +28,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 
-from config import CNN_INPUT_SIZE, DATASET_DIR, DICE_FACES, ONNX_MODEL_PATH
+from config import CHECKPOINT_PATH, CNN_INPUT_SIZE, DATASET_DIR, DICE_FACES, ONNX_MODEL_PATH
 
 # ============================================================================
 # HIPERPARAMETROS
@@ -38,10 +41,10 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 TRAIN_SPLIT = 0.8
 NUM_CLASSES = len(DICE_FACES)
-CHECKPOINT_PATH = "best_model.pth"
 
 
 def set_seed(seed: int) -> None:
+    """Fija semillas de ``random``, NumPy y PyTorch para resultados reproducibles."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -52,10 +55,15 @@ def set_seed(seed: int) -> None:
 # ============================================================================
 
 class DiceDataset(Dataset):
-    """Dataset que carga crops de dados con OpenCV (BGR) para mantener
-    paridad con DiceClassifier.preprocess_crop() en inferencia."""
+    """``torch.utils.data.Dataset`` que lee recortes en disco en BGR uint8."""
 
     def __init__(self, image_paths, labels, transform=None):
+        """
+        Args:
+            image_paths: Lista de rutas a PNG por clase.
+            labels: Enteros de clase alineados con ``DICE_FACES``.
+            transform: Opcional; composiciones ``torchvision`` sobre tensor CHW float en [0,1].
+        """
         self.image_paths = image_paths
         self.labels = labels
         self.transform = transform
@@ -64,7 +72,7 @@ class DiceDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        # BGR uint8 — mismo que classifier.py usa en inferencia
+        # BGR uint8 — coherente con inferencia ONNX
         img = cv2.imread(self.image_paths[idx])
         img = cv2.resize(img, CNN_INPUT_SIZE)       # (64, 64, 3)
         img = img.astype(np.float32) / 255.0        # [0, 1]
@@ -77,7 +85,11 @@ class DiceDataset(Dataset):
 
 
 def load_dataset():
-    """Carga rutas de imagenes y labels desde DATASET_DIR/{clase}/."""
+    """Recorre ``DATASET_DIR`` y construye listas paralelas de rutas e índices de clase.
+
+    Returns:
+        Tupla ``(paths, labels)`` con ``labels`` como array NumPy de enteros ``0 .. len(DICE_FACES)-1``.
+    """
     paths = []
     labels = []
 
@@ -138,6 +150,7 @@ class DiceCNN(nn.Module):
         )
 
     def forward(self, x):
+        """Forward: logits de forma ``(B, num_classes)`` (sin softmax)."""
         x = self.block1(x)
         x = self.block2(x)
         x = self.block3(x)
@@ -150,6 +163,7 @@ class DiceCNN(nn.Module):
 # ============================================================================
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
+    """Una época de entrenamiento; retorna pérdida media y accuracy por batch acumulado."""
     model.train()
     running_loss = 0.0
     correct = 0
@@ -173,6 +187,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 
 
 def evaluate(model, loader, criterion, device):
+    """Evalúa en modo eval; devuelve pérdida, accuracy y arrays de predicciones/etiquetas."""
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -199,7 +214,7 @@ def evaluate(model, loader, criterion, device):
 
 
 def make_weighted_sampler(labels):
-    """Sampler ponderado para compensar desbalance entre clases."""
+    """Construye un ``WeightedRandomSampler`` inversamente proporcional al tamaño de clase."""
     class_counts = np.bincount(labels, minlength=NUM_CLASSES)
     class_weights = 1.0 / np.maximum(class_counts, 1)
     sample_weights = class_weights[labels]
@@ -246,6 +261,7 @@ def validate_onnx():
 # ============================================================================
 
 def train():
+    """Orquesta carga de datos, bucle de épocas, evaluación final y exportación ONNX."""
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")

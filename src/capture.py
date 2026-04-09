@@ -1,14 +1,16 @@
 """
-Script de captura de fotos desde la posicion de escaneo del robot Niryo.
+Captura de datos para entrenar la CNN de caras de dado (cámara del Niryo).
 
-Conecta al robot, se posiciona en scan y muestra un live feed por OpenCV.
-Detecta dados en el workspace y permite guardar los crops individuales
-etiquetados para entrenar la CNN.
+El robot adopta la pose de escaneo o, con ``--low``, una pose más baja para mayor resolución
+en los recortes. ``extract_dice_crops`` segmenta dados por bordes (Canny + morfología) dentro
+del polígono del workspace, excluyendo zonas cercanas a las dianas.
 
-Modos de uso:
-    python capture.py                # Interactivo: detecta dados, pide etiqueta por cada crop
-    python capture.py --raw          # Guarda frame completo sin etiquetar en dataset/raw/
-    python capture.py --label J      # Todos los crops se etiquetan como "J"
+Modos de línea de comandos::
+
+    python capture.py                  # Etiqueta interactiva por crop (terminal)
+    python capture.py --raw            # Frames completos en dataset/raw/
+    python capture.py --label J        # Todos los crops con la misma cara
+    python capture.py --low            # Z=0.18 m para crops más grandes
 """
 
 import argparse
@@ -46,7 +48,7 @@ CAPTURE_POSITION = (
 
 
 def setup_dirs(label: str = None) -> str:
-    """Crea el directorio destino y retorna la ruta."""
+    """Crea si no existe el directorio de destino (clase o ``raw``) y devuelve su ruta."""
     if label:
         target = os.path.join(DATASET_DIR, label)
     else:
@@ -56,17 +58,20 @@ def setup_dirs(label: str = None) -> str:
 
 
 def generate_filename(prefix: str = "capture") -> str:
-    """Genera un nombre unico basado en timestamp."""
+    """Devuelve ``{prefix}_{timestamp_ms}.png`` para nombres únicos."""
     ts = int(time.time() * 1000)
     return f"{prefix}_{ts}.png"
 
 
 def extract_dice_crops(frame: np.ndarray, workspace_corners: np.ndarray) -> List[Tuple[np.ndarray, tuple]]:
-    """Detecta dados en el frame y retorna lista de (crop, bounding_rect).
+    """Segmenta dados por bordes dentro del workspace y devuelve recortes con padding.
 
-    Estrategia: enmascarar el interior del workspace, usar Canny para detectar
-    bordes (funciona con dados claros sobre fondo claro) y cerrar contornos
-    con morfologia para obtener regiones solidas.
+    Estrategia: máscara poligonal del workspace (erosionada para ignorar el marco), Canny sobre
+    gris suavizado, morfología para cerrar contornos, filtrado por ``DICE_MIN_AREA`` /
+    ``DICE_MAX_AREA`` y exclusión de regiones cerca de las esquinas (dianas).
+
+    Returns:
+        Lista de ``(crop_bgr, (x, y, w, h))`` con ``w,h`` del rectángulo ampliado por ``CROP_PADDING``.
     """
     h_frame, w_frame = frame.shape[:2]
 
@@ -138,7 +143,7 @@ def extract_dice_crops(frame: np.ndarray, workspace_corners: np.ndarray) -> List
 
 
 def draw_detections(display: np.ndarray, crops: List[Tuple[np.ndarray, tuple]]) -> None:
-    """Dibuja bounding boxes numerados sobre los dados detectados."""
+    """Superpone rectángulos verdes y numeración 1..N sobre ``display``."""
     for i, (_, (x, y, w, h)) in enumerate(crops, start=1):
         cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
         cv2.putText(display, str(i), (x, max(15, y - 5)),
@@ -146,6 +151,16 @@ def draw_detections(display: np.ndarray, crops: List[Tuple[np.ndarray, tuple]]) 
 
 
 def run_capture(raw_mode: bool = False, fixed_label: str = None, low: bool = False) -> None:
+    """Bucle principal: vista en vivo, detección de dados y guardado según modo.
+
+    Args:
+        raw_mode: Si True, ``ESPACIO`` guarda el frame completo en ``dataset/raw/``.
+        fixed_label: Si se indica (p. ej. ``"J"``), todos los crops van a esa carpeta de clase.
+        low: Si True, detecta workspace en pose de scan y baja a ``CAPTURE_POSITION`` para capturar.
+
+    Teclas en la ventana ``Captura Niryo``: espacio = guardar según modo; ``f`` = frame de referencia;
+    ``q``/ESC = salir. Al terminar se imprime un resumen por carpeta de cara.
+    """
     picker = NiryoVisionPicker(ROBOT_IP)
     workspace_corners = None
 

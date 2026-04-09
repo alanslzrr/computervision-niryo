@@ -1,9 +1,13 @@
 """
-Control del robot Niryo y mapeo de coordenadas relativas a cartesianas del robot.
+Control del robot Niryo y mapeo de coordenadas de imagen a espacio cartesiano del robot.
 
-Gestiona conexion, calibracion, captura de imagen y movimientos de pick-and-place.
-El mapeo relative_to_robot_xy convierte coordenadas normalizadas [0,1] (generadas
-por vision.pixel_to_relative) a posiciones cartesianas del robot.
+Responsabilidades:
+    - Conexión, calibración y captura desde la cámara del brazo.
+    - Movimientos de escaneo, home y pick-and-place asociados al laboratorio de visión.
+    - Conversión de coordenadas relativas ``[0, 1] × [0, 1]`` (salida de ``vision.pixel_to_relative``)
+      a ``(x, y)`` en metros mediante interpolación bilineal sobre las cuatro esquinas calibradas.
+
+Dependencias: ``pyniryo`` para ``NiryoRobot`` y ``PoseObject``.
 """
 
 from typing import Optional, Tuple
@@ -22,15 +26,33 @@ from config import (
 
 
 def pose_from_tuple(p: Tuple[float, float, float, float, float, float]) -> PoseObject:
-    """Convierte una tupla de 6 valores (x,y,z,roll,pitch,yaw) en un PoseObject del Niryo."""
+    """Construye un ``PoseObject`` a partir de una tupla (x, y, z, roll, pitch, yaw).
+
+    Args:
+        p: Seis valores en metros y radianes según la convención de pyniryo.
+
+    Returns:
+        Instancia lista para pasar a ``NiryoRobot.move``.
+    """
     return PoseObject(*p)
 
 
 class NiryoVisionPicker:
-    """Controlador del robot Niryo con integracion de vision. Gestiona conexion, captura de
-    imagen y ejecucion de movimientos de pick-and-place sobre piezas detectadas."""
+    """Orquestador de visión + robot: filtros de UI, workspace, columnas de depósito y captura.
 
-    def __init__(self, ip: str):
+    Attributes:
+        ip: Dirección IP del robot.
+        robot: Instancia de ``NiryoRobot`` tras ``connect``, o None si no hay conexión.
+        filter_color: Filtro de color para piezas del lab. anterior: ``ANY`` | ``RED`` | ``GREEN`` | ``BLUE``.
+        filter_shape: Filtro de forma: ``ANY`` | ``CIRCLE`` | ``SQUARE``.
+        selected_index: Índice 1-based de la pieza/dado seleccionado en la lista filtrada, o None.
+        pick_roll, pick_pitch, pick_yaw: Orientación de herramienta reutilizada en picks (desde scan).
+        workspace_corners: Matriz (4, 2) float32 con esquinas TL, TR, BR, BL en píxeles, o None.
+        face_columns: Asignación cara de dado → índice de columna de depósito (módulo poker).
+        face_slot_counts: Contador de slots usados por cara para apilar en columna.
+    """
+
+    def __init__(self, ip: str) -> None:
         self.ip = ip
         self.robot: Optional[NiryoRobot] = None
 
@@ -45,11 +67,39 @@ class NiryoVisionPicker:
         # Workspace detectado desde dianas (TL, TR, BR, BL)
         self.workspace_corners: Optional[np.ndarray] = None
 
+        # Asignación de columnas de drop por cara (poker dice)
+        self.face_columns: dict = {}
+        self.face_slot_counts: dict = {}
+
+    def reset_drops(self) -> None:
+        """Reinicia columnas y contadores de slots entre rondas de poker dice."""
+        self.face_columns = {}
+        self.face_slot_counts = {}
+        print("[DROP] Columnas y slots reseteados")
+
+    def assign_drop_slot(self, face: str) -> Tuple[int, int]:
+        """Reserva la siguiente celda (columna, slot) para una cara de dado.
+
+        La primera aparición de una cara obtiene la siguiente columna libre; sucesivos dados de la
+        misma cara incrementan el slot vertical dentro de esa columna.
+
+        Args:
+            face: Etiqueta de cara (p. ej. ``"J"``).
+
+        Returns:
+            ``(col_idx, slot_idx)`` índices sobre ``config.DROP_COLUMN_X_REL`` y ``DROP_SLOT_Y_REL``.
+        """
+        if face not in self.face_columns:
+            self.face_columns[face] = len(self.face_columns)
+        col_idx = self.face_columns[face]
+        slot_idx = self.face_slot_counts.get(face, 0)
+        self.face_slot_counts[face] = slot_idx + 1
+        return col_idx, slot_idx
+
     def connect(self) -> None:
-        """Conecta al robot, ejecuta calibracion automatica e intenta detectar la herramienta."""
+        """Conecta al robot, ejecuta calibración automática e intenta detectar la herramienta."""
         print(f"Conectando al robot: {self.ip}")
         self.robot = NiryoRobot(self.ip)
-        # Limpiar colision pendiente de sesiones anteriores para permitir movimientos
         try:
             self.robot.clear_collision_detected()
         except Exception:
@@ -64,17 +114,15 @@ class NiryoVisionPicker:
             print(f"[WARN] No se pudo detectar herramienta automaticamente: {e}")
 
     def move_scan(self) -> None:
-        """Mueve el robot a la pose de escaneo donde la camara enfoca el workspace."""
+        """Mueve el brazo a la pose de escaneo definida en ``config.SCANNING_POSITION``."""
         self.robot.move(pose_from_tuple(SCANNING_POSITION))
 
     def move_home(self) -> None:
-        """Mueve el robot a su posicion home oficial."""
+        """Mueve el robot a la pose home del firmware."""
         self.robot.move_to_home_pose()
 
     def clear_collision(self) -> None:
-        """Resetea el estado de error tras una colision detectada.
-        IMPORTANTE: Retirar siempre el obstaculo antes de invocar.
-        Tras limpiar, se ejecuta calibracion automatica para re-sincronizar."""
+        """Limpia el flag de colisión y recalibra. Retirar el obstáculo antes de llamar."""
         if self.robot is None:
             raise RuntimeError("Robot no conectado")
         print("[COLLISION] Limpiando flag de colision y re-calibrando...")
@@ -83,7 +131,7 @@ class NiryoVisionPicker:
         print("[COLLISION] Estado de colision restablecido. Robot listo.")
 
     def safe_shutdown(self) -> None:
-        """Cierre seguro: libera pinza, vuelve a home y desconecta el robot."""
+        """Intenta abrir la pinza, ir a home y cerrar la conexión de forma ordenada."""
         if self.robot is None:
             return
 
@@ -103,7 +151,14 @@ class NiryoVisionPicker:
             print("Robot desconectado")
 
     def capture_frame(self) -> np.ndarray:
-        """Captura un frame desde la camara del robot y lo decodifica como imagen BGR."""
+        """Obtiene un fotograma BGR desde la cámara comprimida del robot.
+
+        Returns:
+            Imagen ``numpy`` en BGR, misma convención que OpenCV.
+
+        Raises:
+            RuntimeError: Si la decodificación JPEG falla.
+        """
         img_compressed = self.robot.get_img_compressed()
         frame = cv2.imdecode(np.frombuffer(img_compressed, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
@@ -112,15 +167,23 @@ class NiryoVisionPicker:
 
 
 def relative_to_robot_xy(x_rel: float, y_rel: float) -> Tuple[float, float]:
-    """Convierte coordenadas relativas [0..1]x[0..1] a (x, y) Cartesianas del robot mediante
-    interpolacion bilineal. Tiene en cuenta el espejado del eje X entre camara y robot.
-    Vease los comentarios sobre LIMIT_1..4 para el mapeo fisico de esquinas."""
-    # Eje X de la camara esta espejado respecto al robot:
-    #   izqda en imagen = dcha del robot, y viceversa.
-    p_tl = np.array(LIMIT_4[:2], dtype=float)   # img-TL -> robot dcha-lejos
-    p_bl = np.array(LIMIT_3[:2], dtype=float)   # img-BL -> robot dcha-cerca
-    p_tr = np.array(LIMIT_1[:2], dtype=float)   # img-TR -> robot izqda-lejos
-    p_br = np.array(LIMIT_2[:2], dtype=float)   # img-BR -> robot izqda-cerca
+    """Mapea coordenadas normalizadas del workspace a ``(x, y)`` del robot en metros.
+
+    Interpolación bilineal entre las proyecciones de las cuatro esquinas (``LIMIT_1`` … ``LIMIT_4``).
+    El eje X de la imagen va espejado respecto al sistema del robot (véase comentarios inline).
+
+    Args:
+        x_rel: Fracción horizontal en [0, 1] (izquierda → derecha en imagen).
+        y_rel: Fracción vertical en [0, 1].
+
+    Returns:
+        Par ``(x, y)`` en metros para construir ``PoseObject`` con la Z deseada.
+    """
+    # Eje X de la cámara espejado respecto al robot: izquierda imagen ↔ derecha robot.
+    p_tl = np.array(LIMIT_4[:2], dtype=float)
+    p_bl = np.array(LIMIT_3[:2], dtype=float)
+    p_tr = np.array(LIMIT_1[:2], dtype=float)
+    p_br = np.array(LIMIT_2[:2], dtype=float)
 
     top = p_tl * (1.0 - x_rel) + p_tr * x_rel
     bottom = p_bl * (1.0 - x_rel) + p_br * x_rel

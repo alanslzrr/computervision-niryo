@@ -1,9 +1,13 @@
 """
-Pipeline de vision: deteccion del workspace por dianas y deteccion de piezas.
+Pipeline de visión para el laboratorio de piezas (círculos y cuadrados de color).
 
-Funciones de calibracion del workspace (HoughCircles), transformacion perspectiva
-pixel -> coordenadas relativas [0,1], y deteccion/clasificacion de objetos por
-forma (circularidad) y color (HSV).
+Incluye:
+    - Detección del cuadrilátero del workspace mediante cuatro dianas circulares (``HoughCircles``).
+    - Homografía pixel → coordenadas normalizadas ``[0, 1]²`` para acoplar con ``robot.relative_to_robot_xy``.
+    - Segmentación por rango HSV global + morfología, contornos, filtrado por área y clasificación
+      por forma (circularidad, polígono aproximado) y color (promedio HSV en máscara).
+
+Constantes de área y color: ``config`` (``MIN_AREA``, ``MAX_AREA``, ``COLOR_RANGES``, etc.).
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -25,7 +29,11 @@ from config import (
 # ============================================================================
 
 def fallback_workspace_corners() -> np.ndarray:
-    """Devuelve esquinas de workspace en pixeles cuando no se detectan las dianas. Orden TL, TR, BR, BL."""
+    """Esquinas por defecto del workspace en píxeles si falla la detección por dianas.
+
+    Returns:
+        Array ``(4, 2)`` float32 en orden TL, TR, BR, BL según ``FALLBACK_WORKSPACE_PIXEL_BOUNDS``.
+    """
     x_min = FALLBACK_WORKSPACE_PIXEL_BOUNDS["x_min"]
     x_max = FALLBACK_WORKSPACE_PIXEL_BOUNDS["x_max"]
     y_min = FALLBACK_WORKSPACE_PIXEL_BOUNDS["y_min"]
@@ -40,8 +48,11 @@ def fallback_workspace_corners() -> np.ndarray:
 
 
 def detect_workspace_from_dianas(frame: np.ndarray) -> Optional[np.ndarray]:
-    """Detecta las 4 dianas del workspace con HoughCircles y las asigna a esquinas (TL, TR, BR, BL)
-    segun proximidad a las esquinas de la imagen. Devuelve None si no hay deteccion valida."""
+    """Localiza cuatro círculos de referencia y los ordena como vértices del workspace.
+
+    Returns:
+        Matriz ``(4, 2)`` de centros en orden TL, TR, BR, BL, o None si la geometría no es válida.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (9, 9), 1.5)
 
@@ -106,14 +117,25 @@ def detect_workspace_from_dianas(frame: np.ndarray) -> Optional[np.ndarray]:
 
 
 def point_inside_workspace(point: Tuple[int, int], corners: np.ndarray) -> bool:
-    """Comprueba si un punto (px, py) esta dentro del poligono definido por corners."""
+    """Comprueba si un punto de imagen cae dentro del polígono del workspace.
+
+    Args:
+        point: Coordenadas ``(px, py)`` en píxeles.
+        corners: Cuatro vértices en orden TL, TR, BR, BL (misma convención que homografía).
+
+    Returns:
+        True si el punto está en el interior o sobre el borde (test de OpenCV >= 0).
+    """
     poly = corners.reshape((-1, 1, 2)).astype(np.float32)
     return cv2.pointPolygonTest(poly, point, False) >= 0
 
 
 def pixel_to_relative(px: int, py: int, corners: np.ndarray) -> Tuple[float, float]:
-    """Mapea un pixel (px, py) a coordenadas relativas [0..1]x[0..1] mediante homografia
-    con las esquinas TL, TR, BR, BL del workspace. Las coordenadas se recortan al rango [0,1]."""
+    """Aplica homografía inversa pixel → plano normalizado del workspace.
+
+    Returns:
+        Par ``(x_rel, y_rel)`` en ``[0, 1]``, recortado para evitar extrapolaciones fuera del cuadrilátero.
+    """
     src = corners.astype(np.float32)
     dst = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
     H = cv2.getPerspectiveTransform(src, dst) # matriz de homografia
@@ -131,8 +153,16 @@ def pixel_to_relative(px: int, py: int, corners: np.ndarray) -> Tuple[float, flo
 # ============================================================================
 
 def classify_shape(num_vertices: int, aspect_ratio: float, circularity: float) -> str:
-    """Clasifica la forma segun numero de vertices (approx), relacion de aspecto y circularidad.
-    Retorna CIRCLE, SQUARE o OTHER."""
+    """Clasifica la forma a partir de la aproximación poligonal y métricas geométricas.
+
+    Args:
+        num_vertices: Vértices del polígono simplificado (``approxPolyDP``).
+        aspect_ratio: Ancho / alto del rectángulo delimitador.
+        circularity: 4*pi*area/perimetro^2 (métrica de circularidad de OpenCV).
+
+    Returns:
+        ``"CIRCLE"``, ``"SQUARE"`` u ``"OTHER"``.
+    """
     if circularity > 0.85:
         return "CIRCLE"
     if num_vertices == 4 and 0.85 <= aspect_ratio <= 1.15:
@@ -141,8 +171,11 @@ def classify_shape(num_vertices: int, aspect_ratio: float, circularity: float) -
 
 
 def detect_color(image: np.ndarray, contour: np.ndarray) -> str:
-    """Obtiene el color predominante en la region del contorno usando el promedio HSV
-    enmascarado. Retorna RED, GREEN, BLUE o UNKNOWN segun COLOR_RANGES."""
+    """Clasifica el color medio HSV del interior del contorno frente a ``COLOR_RANGES``.
+
+    Returns:
+        ``"RED"``, ``"GREEN"``, ``"BLUE"`` o ``"UNKNOWN"`` si ningún rango contiene la media.
+    """
     mask = np.zeros(image.shape[:2], dtype=np.uint8)
     cv2.drawContours(mask, [contour], -1, 255, -1)
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -159,8 +192,11 @@ def detect_color(image: np.ndarray, contour: np.ndarray) -> str:
 
 
 def preprocess(frame: np.ndarray) -> np.ndarray:
-    """Preprocesa el frame: pasa a HSV, umbraliza para obtener regiones de interes y aplica
-    morfologia (apertura + cierre) para limpiar ruido y cerrar huecos en los contornos."""
+    """Binariza por saturación/valor en HSV y limpia con morfología.
+
+    Returns:
+        Máscara binaria ``uint8`` lista para ``findContours``.
+    """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     binary = cv2.inRange(hsv, np.array([0, 70, 50]), np.array([180, 255, 255]))
     kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -172,8 +208,12 @@ def preprocess(frame: np.ndarray) -> np.ndarray:
 
 
 def detect_objects(frame: np.ndarray, workspace_corners: np.ndarray) -> List[Dict]:
-    """Detecta piezas circulares o cuadradas (rojas, verdes o azules) dentro del workspace.
-    Filtra por area, clasifica forma y color, y retorna lista ordenada por area descendente."""
+    """Detecta piezas de laboratorio (círculo/cuadrado, RGB) dentro del polígono del workspace.
+
+    Returns:
+        Lista de diccionarios con claves ``shape``, ``color``, ``centroid``, ``bounding_rect``, ``area``,
+        ordenados por área descendente.
+    """
     binary = preprocess(frame)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 

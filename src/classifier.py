@@ -1,8 +1,9 @@
 """
-Clasificador de caras de dados de poker mediante CNN exportada a ONNX.
+Clasificación de caras de dados de poker mediante modelo CNN en ONNX Runtime.
 
-Carga un modelo ONNX entrenado con PyTorch (train.py) y clasifica crops
-de dados en una de seis caras: 9, 10, J, Q, K, A.
+El archivo ``dice_classifier.onnx`` se genera con ``train.py`` (PyTorch → ONNX). Las clases
+siguen el orden de ``config.DICE_FACES``. El preprocesado debe ser idéntico al del entrenamiento
+(resize BGR, normalización [0, 1], NCHW).
 """
 
 import os
@@ -15,9 +16,18 @@ from config import CNN_CONFIDENCE_THRESHOLD, CNN_INPUT_SIZE, DICE_FACES, ONNX_MO
 
 
 class DiceClassifier:
-    """Clasificador de caras de dados usando inferencia ONNX Runtime."""
+    """Inferencia ONNX para asignar una cara de dado a un recorte de imagen.
 
-    def __init__(self, model_path: str = ONNX_MODEL_PATH):
+    Si el archivo del modelo no existe, ``classify`` devuelve ``("UNKNOWN", 0.0)`` sin lanzar error.
+
+    Attributes:
+        model_path: Ruta al fichero ``.onnx``.
+        session: Sesión ``onnxruntime.InferenceSession`` o None si no hay modelo.
+        input_name: Nombre del tensor de entrada según el grafo ONNX.
+        output_name: Nombre del tensor de salida (logits).
+    """
+
+    def __init__(self, model_path: str = ONNX_MODEL_PATH) -> None:
         self.model_path = model_path
         self.session = None
         self.input_name = None
@@ -30,23 +40,39 @@ class DiceClassifier:
             self.output_name = self.session.get_outputs()[0].name
 
     def preprocess_crop(self, crop: np.ndarray) -> np.ndarray:
-        """Preprocesa un crop BGR para entrada a la CNN.
-        Replica exactamente el pipeline de train.py: resize, /255, HWC->CHW."""
+        """Prepara un recorte BGR para la entrada de la red.
+
+        Replica el pipeline de ``train.DiceDataset`` / entrenamiento: redimensionado a
+        ``CNN_INPUT_SIZE``, división por 255, permutación HWC → CHW y dimensión batch.
+
+        Args:
+            crop: Imagen BGR ``uint8`` del dado recortado.
+
+        Returns:
+            Tensor float32 con forma ``(1, 3, H, W)``.
+        """
         resized = cv2.resize(crop, CNN_INPUT_SIZE)
         normalized = resized.astype(np.float32) / 255.0
-        chw = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
-        batched = np.expand_dims(chw, axis=0)       # (1, 3, H, W)
+        chw = np.transpose(normalized, (2, 0, 1))
+        batched = np.expand_dims(chw, axis=0)
         return batched
 
     def classify(self, crop: np.ndarray) -> Tuple[str, float]:
-        """Clasifica un crop de dado y retorna (face_label, confidence)."""
+        """Ejecuta softmax sobre los logits y devuelve la clase ganadora si supera el umbral.
+
+        Args:
+            crop: Recorte BGR del dado.
+
+        Returns:
+            ``(etiqueta, confianza)``. La etiqueta es ``"UNKNOWN"`` si no hay sesión o si
+            ``confianza < CNN_CONFIDENCE_THRESHOLD``.
+        """
         if self.session is None:
             return ("UNKNOWN", 0.0)
 
         tensor = self.preprocess_crop(crop)
         logits = self.session.run([self.output_name], {self.input_name: tensor})[0][0]
 
-        # Softmax
         exp_logits = np.exp(logits - np.max(logits))
         probs = exp_logits / exp_logits.sum()
 

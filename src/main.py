@@ -13,11 +13,7 @@ METODOLOGIA:
     - Transformacion perspectiva pixel -> coordenadas relativas -> coordenadas Cartesianas del robot.
     - Control interactivo por terminal con filtros y seleccion manual de la pieza a recoger.
 
-AUTORES:
-    Yago Ramos Sanchez, Alan Ariel Salazar
-    Universidad Intercontinental de la Empresa
-    Ingenieria en Sistemas Inteligentes
-    Computer Vision
+
 """
 
 import queue
@@ -42,8 +38,12 @@ from vision import detect_objects, detect_workspace_from_dianas, fallback_worksp
 
 
 def run() -> None:
-    """Punto de entrada principal: conecta al robot, arranca el bucle de vision y procesamiento
-    de comandos. Muestra ventana OpenCV con deteccion en tiempo real y permite control por terminal."""
+    """Ejecuta el bucle principal del laboratorio de piezas con forma/color.
+
+    Conecta al Niryo, posiciona en escaneo, lanza un hilo de lectura de comandos por terminal y
+    muestra ``Niryo Vision Menu`` con overlay del workspace, detecciones y HUD. Los comandos
+    delegan en ``ui.process_command`` (pick, filtros, salida, etc.).
+    """
     picker = NiryoVisionPicker(ROBOT_IP)
     cmd_queue: "queue.Queue[str]" = queue.Queue()
 
