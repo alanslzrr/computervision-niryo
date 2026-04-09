@@ -95,9 +95,6 @@ wandb/
 mlruns/
 lightning_logs/
 
-# Datos y capturas locales (ajusta si quieres versionar muestras pequeñas)
-dataset/
-
 # Logs y temporales
 *.log
 tmp/
