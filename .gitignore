@@ -1,0 +1,109 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pyenv
+.python-version
+
+# mypy / Ruff / other tools
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+
+# IDEs
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Secrets y variables locales (IPs, tokens)
+.env
+.env.*
+!.env.example
+
+# PyTorch / entrenamiento (pesos suelen ser muy grandes)
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+runs/
+wandb/
+mlruns/
+lightning_logs/
+
+# Datos y capturas locales (ajusta si quieres versionar muestras pequeñas)
+dataset/
+
+# Logs y temporales
+*.log
+tmp/
+temp/
+*.tmp
+
+# OpenCV / capturas accidentales en raíz del proyecto
+*.avi
+*.mp4
